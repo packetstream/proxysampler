@@ -1,0 +1,3 @@
+https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111
+https://proxyuser:proxypass_country-CA@proxy.packetstream.io:31111
+https://proxyuser:proxypass_country-GB@proxy.packetstream.io:31111
