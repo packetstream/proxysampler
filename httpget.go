@@ -75,27 +75,28 @@ func getHTTP(fetchURL string, proxy string) (res *result, err error) {
 
 // testProxies takes a slice of strings with proxy information, calls getHTTP to test them, and runs the report when finished
 func testProxies(proxies []string) {
-	for _, proxy := range proxies {
+	for i, proxy := range proxies {
 		activeThreads--
 
-		// Run getHTTP calls a concurrently
-		go func() {
-			res, err := getHTTP(testURL, proxy)
-			addResult(res, err)
-		}()
-
-		// Wait if all threads are occupied
-		for activeThreads < 0 {
+		// Sleep for specified delay between reqs
+		if i > 0 {
 			time.Sleep(time.Duration(delay) * time.Millisecond)
 		}
 
-		// Sleep for specified delay between reqs
-		time.Sleep(time.Duration(delay) * time.Millisecond)
+		// Run getHTTP calls a concurrently
+		go func() {
+			// Wait if all threads are occupied
+			for activeThreads < 0 {
+				time.Sleep(time.Duration(delay) * time.Millisecond)
+			}
+			res, err := getHTTP(testURL, proxy)
+			addResult(res, err)
+		}()
 	}
 
 	// Wait for all tests to complete
 	for activeThreads < maxThreads {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Stop the progress bar
