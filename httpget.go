@@ -50,8 +50,12 @@ func getHTTP(fetchURL string, proxy string) (res *result, err error) {
 		panic(err)
 	}
 	tr := http.Transport{
-		Proxy:           http.ProxyURL(p),
-		TLSClientConfig: &tls.Config{},
+		Proxy:                 http.ProxyURL(p),
+		TLSClientConfig:       &tls.Config{},
+		TLSHandshakeTimeout:   5 * time.Second,
+		IdleConnTimeout:       5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
 	}
 
 	if r, err = tr.RoundTrip(req); err != nil {
