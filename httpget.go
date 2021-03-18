@@ -8,6 +8,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cheggaaa/pb"
@@ -53,9 +54,10 @@ func getHTTP(fetchURL string, proxy string) (res *result, err error) {
 		Proxy:                 http.ProxyURL(p),
 		TLSClientConfig:       &tls.Config{},
 		TLSHandshakeTimeout:   5 * time.Second,
-		IdleConnTimeout:       5 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
+		DisableKeepAlives:     true,
+		MaxConnsPerHost:       0,
 	}
 
 	if r, err = tr.RoundTrip(req); err != nil {
@@ -72,6 +74,7 @@ func getHTTP(fetchURL string, proxy string) (res *result, err error) {
 			res.ResponseBody = string(b)
 		}
 	}
+	r.Body.Close()
 
 	res.StatusCode = r.StatusCode
 	return
@@ -79,37 +82,63 @@ func getHTTP(fetchURL string, proxy string) (res *result, err error) {
 
 // testProxies takes a slice of strings with proxy information, calls getHTTP to test them, and runs the report when finished
 func testProxies(proxies []string) {
-	for i, proxy := range proxies {
-		activeThreads--
+	proxiesCh := make(chan string, maxThreads)
+	resultsCh := make(chan *result)
+	done := make(chan struct{})
 
-		// Sleep for specified delay between reqs
-		if i > 0 {
-			time.Sleep(time.Duration(delay) * time.Millisecond)
+	var wg sync.WaitGroup
+
+	for w := 1; w <= maxThreads; w++ {
+		// Run getHTTP calls a concurrently
+		wg.Add(1)
+		go func(proxies chan string, results chan *result) {
+			defer wg.Done()
+			for proxy := range proxies {
+				time.Sleep(time.Duration(delay) * time.Millisecond)
+				res, err := getHTTP(testURL, proxy)
+				if res == nil {
+					res = &result{}
+				}
+
+				if err != nil {
+					res.Err = err
+				}
+
+				results <- res
+			}
+		}(proxiesCh, resultsCh)
+	}
+
+	go func(resultsCh chan *result) {
+		for res := range resultsCh {
+			results = append(results, res)
+
+			if output == "plaintext" {
+				bar.Increment()
+			}
 		}
 
-		// Run getHTTP calls a concurrently
-		go func() {
-			// Wait if all threads are occupied
-			for activeThreads < 0 {
-				time.Sleep(time.Duration(delay) * time.Millisecond)
-			}
-			res, err := getHTTP(testURL, proxy)
-			addResult(res, err)
-		}()
+		// Stop the progress bar
+		if output == "plaintext" {
+			bar.Finish()
+		}
+
+		// Display the report
+		displayReport(results)
+		done <- struct{}{}
+	}(resultsCh)
+
+	for _, proxy := range proxies {
+		proxiesCh <- proxy
 	}
 
-	// Wait for all tests to complete
-	for activeThreads < maxThreads {
-		time.Sleep(100 * time.Millisecond)
-	}
+	close(proxiesCh)
 
-	// Stop the progress bar
-	if output == "plaintext" {
-		bar.Finish()
-	}
+	wg.Wait()
 
-	// Display the report
-	displayReport(results)
+	close(resultsCh)
+
+	<- done
 }
 
 // testProxiesFromFile reads a file for proxy information and passes them to testProxies

@@ -31,7 +31,7 @@ type report struct {
 }
 
 var results []*result
-var activeThreads = maxThreads
+var activeThreads = 0
 var remainingThreads = 0
 var bar *pb.ProgressBar
 var output = "plaintext"
@@ -53,7 +53,6 @@ func init() {
 		case "--help", "-h":
 			showHelp()
 			return
-			break
 		default:
 			break
 		}
@@ -110,6 +109,7 @@ func init() {
 
 // main
 func main() {
+	activeThreads = maxThreads
 	if singleProxy != "" {
 		testProxies([]string{singleProxy})
 		return
@@ -121,7 +121,7 @@ func main() {
 // setOutput validates output format selection
 func setOutput(outputType string) {
 	switch outputType {
-	case "json", "yaml":
+	case "json", "yaml", "plaintext":
 		output = outputType
 		break
 	default:
