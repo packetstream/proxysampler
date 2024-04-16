@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"os"
 
-	"gopkg.in/yaml.v1"
+	"gopkg.in/yaml.v2"
 )
 
-
-// displayReport outputs a report of proxy performance & health
+// displayReport outputs a report of proxy performance & health.
 func displayReport(results []*result) {
 	success := 0
 	fail := 0
@@ -23,6 +22,7 @@ func displayReport(results []*result) {
 
 		if v.StatusCode == -1 {
 			fail++
+
 			continue
 		}
 
@@ -46,6 +46,7 @@ func displayReport(results []*result) {
 
 		// Write to stdout
 		os.Stdout.Write(b)
+
 		return
 	case "yaml":
 		// YAML formatted report
@@ -58,12 +59,13 @@ func displayReport(results []*result) {
 
 		// Write to stdout
 		os.Stdout.Write(b)
+
 		return
 	default:
 		break
 	}
 
 	// Plaintext formatted report
-	fmt.Println(fmt.Sprintf("Success rate:      %d/%d", success, success+fail))
-	fmt.Println(fmt.Sprintf("Average TTFB:      %dms", averageTTFB))
+	fmt.Printf("Success rate:      %d/%d\n", success, len(results))
+	fmt.Printf("Average TTFB:      %dms\n", averageTTFB)
 }

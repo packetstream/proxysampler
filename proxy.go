@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
-	"io/ioutil"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -12,76 +15,107 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb"
+	"golang.org/x/net/proxy"
 )
 
-// getHTTP fetches a resource using a supplied proxy and returns a result item for the report
-func getHTTP(fetchURL string, proxy string) (res *result, err error) {
-	res = &result{}
-	res.Proxy = proxy
-	res.Endpoint = fetchURL
-	req, _ := http.NewRequest("GET", fetchURL, nil)
+const timeout = 5 * time.Second
+
+// proxiedRequest makes a request to an endpoint using a proxy.
+func proxiedRequest(proxyURL string, endpoint string) (*result, error) {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	var start, connect, tlsHandshake time.Time
+
+	res := &result{
+		Proxy:    proxyURL,
+		Endpoint: endpoint,
+	}
 
 	// Measure response times
 	trace := &httptrace.ClientTrace{
 		TLSHandshakeStart: func() { tlsHandshake = time.Now() },
 		TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
-			res.Latency.TLSHandshake = time.Since(tlsHandshake).Nanoseconds() / 1000000
+			res.Latency.TLSHandshake = time.Since(tlsHandshake).Nanoseconds() / 1000000 //nolint:gomnd
 		},
 
 		ConnectStart: func(network, addr string) { connect = time.Now() },
 		ConnectDone: func(network, addr string, err error) {
-			res.Latency.Connect = time.Since(connect).Nanoseconds() / 1000000
+			res.Latency.Connect = time.Since(connect).Nanoseconds() / 1000000 //nolint:gomnd
 		},
 
 		GotFirstResponseByte: func() {
-			res.Latency.TTFB = time.Since(start).Nanoseconds() / 1000000
+			res.Latency.TTFB = time.Since(start).Nanoseconds() / 1000000 //nolint:gomnd
 		},
 	}
 
+	// Create a new request with the trace context
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-	var r *http.Response
-
 	start = time.Now()
-
-	// Set proxy
-	p, err := url.Parse(proxy)
+	p, err := url.Parse(proxyURL)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
+
 	tr := http.Transport{
-		Proxy:                 http.ProxyURL(p),
-		TLSClientConfig:       &tls.Config{},
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
-		ExpectContinueTimeout: 5 * time.Second,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: timeout,
 		DisableKeepAlives:     true,
 		MaxConnsPerHost:       0,
 	}
 
-	if r, err = tr.RoundTrip(req); err != nil {
-		res.StatusCode = -1
-		return
+	// Create a client based on the proxy scheme
+	switch p.Scheme {
+	case "http", "https":
+		// HTTP/HTTPS proxy
+		tr.Proxy = http.ProxyURL(p)
+	case "socks5", "socks5h":
+		// SOCKS5 proxy
+		dialer, err := proxy.FromURL(p, proxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		}
+	default:
+		return nil, errors.New("unsupported proxy scheme: " + p.Scheme)
 	}
+
+	r, err := tr.RoundTrip(req)
+	if err != nil {
+		res.StatusCode = -1
+
+		return res, err
+	}
+	defer r.Body.Close()
+
+	res.StatusCode = r.StatusCode
 
 	// Read response body
 	if includeResponseBody && r.Body != nil {
-		b, err := ioutil.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			res.ResponseBody = "ERROR PARSING RESPONSE"
 		} else {
 			res.ResponseBody = string(b)
 		}
 	}
-	r.Body.Close()
 
-	res.StatusCode = r.StatusCode
-	return
+	return res, nil
 }
 
-// testProxies takes a slice of strings with proxy information, calls getHTTP to test them, and runs the report when finished
+// testProxies tests a list of proxies.
 func testProxies(proxies []string) {
+	// Start the progress bar
+	if output == "plaintext" {
+		bar = pb.StartNew(len(proxies))
+	}
+
 	proxiesCh := make(chan string, maxThreads)
 	resultsCh := make(chan *result)
 	done := make(chan struct{})
@@ -89,13 +123,13 @@ func testProxies(proxies []string) {
 	var wg sync.WaitGroup
 
 	for w := 1; w <= maxThreads; w++ {
-		// Run getHTTP calls a concurrently
+		// Run concurrent workers
 		wg.Add(1)
 		go func(proxies chan string, results chan *result) {
 			defer wg.Done()
 			for proxy := range proxies {
 				time.Sleep(time.Duration(delay) * time.Millisecond)
-				res, err := getHTTP(testURL, proxy)
+				res, err := proxiedRequest(proxy, testURL)
 				if res == nil {
 					res = &result{}
 				}
@@ -138,10 +172,10 @@ func testProxies(proxies []string) {
 
 	close(resultsCh)
 
-	<- done
+	<-done
 }
 
-// testProxiesFromFile reads a file for proxy information and passes them to testProxies
+// testProxiesFromFile tests proxies from a file.
 func testProxiesFromFile(fileName string) {
 	// Read proxy file
 	file, err := os.Open(fileName)
@@ -153,14 +187,13 @@ func testProxiesFromFile(fileName string) {
 	var lines []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		// TODO: validate format?
-		lines = append(lines, scanner.Text())
-		remainingThreads++
-	}
+		// Validate format
+		_, err := url.Parse(scanner.Text())
+		if err != nil {
+			panic("Invalid proxy format: " + scanner.Text())
+		}
 
-	// Start the progress bar
-	if output == "plaintext" {
-		bar = pb.StartNew(len(lines))
+		lines = append(lines, scanner.Text())
 	}
 
 	if err := scanner.Err(); err != nil {
