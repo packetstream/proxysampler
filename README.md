@@ -1,5 +1,4 @@
 # ProxySampler. CLI tool for testing & measuring the health of proxy tunnels.
-[![Go Report Card](https://goreportcard.com/badge/github.com/packetstream/proxysampler)](https://goreportcard.com/report/github.com/packetstream/proxysampler)
 
 ProxySampler is a tool for testing proxies and measuring their performance & health.
 
@@ -121,9 +120,7 @@ proxysampler --output json --file ./proxies.txt --endpoint https://ifconfig.co/j
 ## Contributing
 We'd love to accept your improvements! Feel free to fork & submit a pull-request if you'd like to make changes.
 
-## Additional information
-This tool was built by the PacketStream team at [https://packetstream.io](packetstream.io).
+## About PacketStream
+PacketStream is a residential proxy network that enables businesses to access the web through a pool of residential IPs. With PacketStream, you can gather data, scrape websites, and perform other web-related tasks with requests originating from real residential ISPs all over the world.
 
-PacketStream is a residential proxy network powered by peer-to-peer technology that allows business customers to tunnel web traffic through real residential ISP users who opt-in to share their bandwidth with the network.
-
-Get more information about PacketStream on our website: [https://packetstream.io](https://packetstream.io)
+For more information, visit [PacketStream.io](https://packetstream.io/).
