@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,25 +36,49 @@ type result struct {
 	Error        string  `json:"error,omitempty" yaml:"error,omitempty"`
 	ResponseBody string  `json:"response_body,omitempty" yaml:"response_body,omitempty"`
 	Latency      latency `json:"latency" yaml:"latency"`
+	Exit         *exit   `json:"exit,omitempty" yaml:"exit,omitempty"`
+
+	// sticky is set when the proxy asks for a sticky session.
+	sticky bool
 }
 
-// sample requests the endpoint once through each proxy and returns the
-// results in the same order as the proxies.
-func sample(cfg config, proxies []*url.URL, prog *progress) []*result {
-	results := make([]*result, len(proxies))
+// exit describes the IP address a request left the proxy network from, as
+// reported by the exit check endpoint.
+type exit struct {
+	IP      string `json:"ip" yaml:"ip"`
+	Country string `json:"country" yaml:"country"`
+	City    string `json:"city,omitempty" yaml:"city,omitempty"`
+	Org     string `json:"org,omitempty" yaml:"org,omitempty"`
+}
+
+// exitCheckURL returns the caller's IP address and its location as JSON.
+const exitCheckURL = "https://ipinfo.io/json"
+
+// sample requests the endpoint --count times through each proxy and returns
+// the results in the same order as the proxies. onResult, if set, is called
+// with each result as it finishes, one call at a time.
+func sample(cfg config, proxies []*url.URL, prog *progress, onResult func(*result)) []*result {
+	results := make([]*result, len(proxies)*cfg.count)
 	jobs := make(chan int)
 
+	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for range min(cfg.maxThreads, len(proxies)) {
+	for range min(cfg.maxThreads, len(results)) {
 		wg.Go(func() {
 			for i := range jobs {
-				results[i] = request(cfg, proxies[i])
+				res := request(cfg, proxies[i/cfg.count])
+				results[i] = res
+				mu.Lock()
 				prog.done()
+				if onResult != nil {
+					onResult(res)
+				}
+				mu.Unlock()
 			}
 		})
 	}
 
-	for i := range proxies {
+	for i := range results {
 		if i > 0 && cfg.delay > 0 {
 			time.Sleep(cfg.delay)
 		}
@@ -66,7 +93,7 @@ func sample(cfg config, proxies []*url.URL, prog *progress) []*result {
 
 // request makes one request through a proxy, on a new connection.
 func request(cfg config, p *url.URL) *result {
-	res := &result{Proxy: redactProxy(p), Endpoint: cfg.endpoint}
+	res := &result{Proxy: redactProxy(p), Endpoint: cfg.endpoint, sticky: hasSession(p)}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 
@@ -124,6 +151,17 @@ func request(cfg config, p *url.URL) *result {
 		res.Error = "reading response: " + describeError(err, p)
 	case !cfg.expectStatus.ok(resp.StatusCode):
 		res.Error = "unexpected status " + resp.Status
+	case cfg.checkExit:
+		res.Exit, err = parseExit(body)
+		if err != nil {
+			res.Error = err.Error()
+			break
+		}
+		if want := requestedCountry(p); want != "" && !strings.EqualFold(res.Exit.Country, want) {
+			res.Error = fmt.Sprintf("exit country %s, requested %s", res.Exit.Country, want)
+			break
+		}
+		res.OK = true
 	default:
 		res.OK = true
 	}
@@ -151,6 +189,14 @@ func (t *timings) copyTo(l *latency) {
 	defer t.mu.Unlock()
 	t.done = true
 	l.Connect, l.TLSHandshake, l.TTFB = t.latency.Connect, t.latency.TLSHandshake, t.latency.TTFB
+}
+
+func parseExit(body []byte) (*exit, error) {
+	var e exit
+	if err := json.Unmarshal(body, &e); err != nil || e.IP == "" {
+		return nil, errors.New("exit check response has no IP address")
+	}
+	return &e, nil
 }
 
 func newTransport(cfg config, p *url.URL) (*http.Transport, error) {

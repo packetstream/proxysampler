@@ -5,12 +5,15 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -29,8 +32,18 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	var exitRequests atomic.Int64
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/exit/us":
+			_, _ = w.Write([]byte(`{"ip":"203.0.113.1","country":"US","city":"Austin","org":"AS64500 Example"}`))
+			return
+		case "/exit/rotating":
+			fmt.Fprintf(w, `{"ip":"203.0.113.%d","country":"PT"}`, exitRequests.Add(1))
+			return
+		case "/exit/none":
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
 		case "/status/500":
 			w.WriteHeader(http.StatusInternalServerError)
 		case "/slow":
@@ -52,15 +65,27 @@ func newTestEnv(t *testing.T) *testEnv {
 // the decoded report.
 func (env *testEnv) runCLI(t *testing.T, args ...string) (int, report, string) {
 	t.Helper()
+	return env.runCLIWith(t, nil, args...)
+}
+
+// runCLIWith is runCLI with a function that changes the parsed config.
+func (env *testEnv) runCLIWith(t *testing.T, change func(*config), args ...string) (int, report, string) {
+	t.Helper()
 	var stdout, stderr bytes.Buffer
 	cfg, err := parseFlags(append([]string{"--output", "json", "--delay", "0"}, args...), &stderr)
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	cfg.rootCAs = env.rootCAs
+	if change != nil {
+		change(&cfg)
+	}
 	code := execute(cfg, &stdout, &stderr)
 
 	var rep report
+	if cfg.output != "json" {
+		return code, rep, stdout.String()
+	}
 	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
 		t.Fatalf("decoding report: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
 	}
@@ -171,6 +196,8 @@ func TestResponseBody(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
+	t.Setenv("PACKETSTREAM_USER", "")
+	t.Setenv("PACKETSTREAM_AUTH_KEY", "")
 	tests := [][]string{
 		{},
 		{"--proxy", "http://user:pass@host:1", "--file", "x"},
@@ -188,6 +215,14 @@ func TestUsageErrors(t *testing.T) {
 		{"--proxy", "http://user:pass@host:1", "extra"},
 		{"https://user:s3cret@host:1"},
 		{"--bogus"},
+		{"--proxy", "http://user:pass@host:1", "--count", "0"},
+		{"--proxy", "http://user:pass@host:1", "--count", "9223372036854775807"},
+		{"--proxy", "http://user:pass@host:1", "--country", "US"},
+		{"--file", "proxies.txt", "--session", "abc"},
+		{"--protocol", "ftp"},
+		{"--country", "USA"},
+		{"--session", "a_b"},
+		{"--check-exit", "--endpoint", "https://example.com"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -247,6 +282,123 @@ func TestRedactError(t *testing.T) {
 	for _, msg := range []string{`Get "http://user:a/b@host:1"`, `Get "http://user:a%2Fb@host:1"`} {
 		if got := redactError(errors.New(msg), p); strings.Contains(got, "a/b") || strings.Contains(got, "a%2Fb") {
 			t.Errorf("redactError(%q) = %q, want the password removed", msg, got)
+		}
+	}
+}
+
+func TestCount(t *testing.T) {
+	env := newTestEnv(t)
+	code, rep, _ := env.runCLI(t, "--proxy", env.proxy.url("socks5", testPassword), "--endpoint", env.https.URL, "--count", "5")
+	if code != exitOK || len(rep.Results) != 5 || rep.Success != 5 {
+		t.Fatalf("exit %d, %d results, %d successes; want 0, 5, 5", code, len(rep.Results), rep.Success)
+	}
+	if rep.StatusCodes[200] != 5 || rep.TTFB == nil || rep.TTFB.Max < rep.TTFB.P50 {
+		t.Errorf("status codes %v, TTFB %+v", rep.StatusCodes, rep.TTFB)
+	}
+}
+
+func TestCheckExit(t *testing.T) {
+	env := newTestEnv(t)
+	tests := []struct {
+		name        string
+		path        string
+		count       string
+		wantOK      int
+		wantError   string
+		wantChanged int
+	}{
+		{"requested country", "/exit/us", "3", 3, "", 0},
+		// testPassword requests US.
+		{"wrong country", "/exit/rotating", "1", 0, "exit country PT, requested US", 0},
+		{"no exit IP", "/exit/none", "1", 0, "exit check response has no IP address", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, rep, _ := env.runCLIWith(t, func(cfg *config) { cfg.endpoint = env.https.URL + tt.path },
+				"--proxy", env.proxy.url("http", testPassword), "--check-exit", "--count", tt.count)
+			if rep.Success != tt.wantOK {
+				t.Fatalf("%d successes, want %d: %+v", rep.Success, tt.wantOK, rep.Results[0])
+			}
+			if tt.wantError != "" && rep.Errors[tt.wantError] == 0 {
+				t.Errorf("errors %v, want %q", rep.Errors, tt.wantError)
+			}
+		})
+	}
+
+	_, rep, _ := env.runCLIWith(t, func(cfg *config) { cfg.endpoint = env.https.URL + "/exit/us" },
+		"--proxy", env.proxy.url("http", testPassword), "--check-exit", "--count", "3")
+	want := exitSummary{UniqueIPs: 1, Countries: map[string]int{"US": 3}, StickySessions: 1}
+	if rep.Exits == nil || rep.Exits.UniqueIPs != want.UniqueIPs || rep.Exits.Countries["US"] != 3 ||
+		rep.Exits.StickySessions != 1 || rep.Exits.SessionsChangedIP != 0 {
+		t.Errorf("exits %+v, want %+v", rep.Exits, want)
+	}
+	if e := rep.Results[0].Exit; e == nil || e.City != "Austin" {
+		t.Errorf("exit %+v, want the exit check response", e)
+	}
+}
+
+func TestStickySessionChangedIP(t *testing.T) {
+	env := newTestEnv(t)
+	// A session with no country modifier, so the PT exits are accepted.
+	password := "s3cret_session-abc"
+	env.proxy.password = password
+	_, rep, _ := env.runCLIWith(t, func(cfg *config) { cfg.endpoint = env.https.URL + "/exit/rotating" },
+		"--proxy", env.proxy.url("http", password), "--check-exit", "--count", "3")
+	if rep.Success != 3 || rep.Exits == nil || rep.Exits.UniqueIPs != 3 || rep.Exits.SessionsChangedIP != 1 {
+		t.Fatalf("success %d, exits %+v; want 3 successes and one session that changed IP", rep.Success, rep.Exits)
+	}
+}
+
+func TestJSONLines(t *testing.T) {
+	env := newTestEnv(t)
+	_, _, out := env.runCLI(t, "--proxy", env.proxy.url("http", testPassword), "--endpoint", env.https.URL,
+		"--count", "3", "--output", "jsonl")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("%d lines, want 3 results and a summary:\n%s", len(lines), out)
+	}
+	for i, line := range lines {
+		var record struct {
+			Type    string    `json:"type"`
+			OK      bool      `json:"ok"`
+			Success int       `json:"success"`
+			Results []*result `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("line %d: %v", i+1, err)
+		}
+		switch {
+		case i < 3 && (record.Type != "result" || !record.OK):
+			t.Errorf("line %d: %s, want a successful result", i+1, line)
+		case i == 3 && (record.Type != "summary" || record.Success != 3 || record.Results != nil):
+			t.Errorf("summary %s, want 3 successes and no results", line)
+		}
+	}
+}
+
+func TestPacketStreamProxy(t *testing.T) {
+	t.Setenv("PACKETSTREAM_USER", "alice")
+	t.Setenv("PACKETSTREAM_AUTH_KEY", "key123")
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{nil, "https://alice:key123@proxy.packetstream.io:31111"},
+		{[]string{"--protocol", "http", "--country", "us"}, "http://alice:key123_country-US@proxy.packetstream.io:31112"},
+		{[]string{"--protocol", "socks5", "--country", "GB", "--session", "s-1"}, "socks5://alice:key123_country-GB_session-s-1@proxy.packetstream.io:31113"},
+		{[]string{"--host", "127.0.0.1", "--session", "abc"}, "https://alice:key123_session-abc@127.0.0.1:31111"},
+	}
+	for _, tt := range tests {
+		cfg, err := parseFlags(tt.args, io.Discard)
+		if err != nil {
+			t.Fatalf("%v: %v", tt.args, err)
+		}
+		proxies, err := loadProxies(cfg)
+		if err != nil {
+			t.Fatalf("%v: %v", tt.args, err)
+		}
+		if got := proxies[0].String(); got != tt.want {
+			t.Errorf("%v: proxy %q, want %q", tt.args, got, tt.want)
 		}
 	}
 }

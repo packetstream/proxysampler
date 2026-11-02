@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,9 @@ const (
 	exitUsage    = 2
 )
 
+// maxRequests limits the number of requests in one run.
+const maxRequests = 1_000_000
+
 type config struct {
 	output              string
 	includeResponseBody bool
@@ -32,6 +36,14 @@ type config struct {
 	timeout             time.Duration
 	expectStatus        statusSet
 	minSuccess          float64
+	count               int
+	checkExit           bool
+
+	// PacketStream proxy options, used when neither --proxy nor --file is set.
+	protocol string
+	country  string
+	session  string
+	host     string
 
 	// rootCAs replaces the system roots in tests.
 	rootCAs *x509.CertPool
@@ -59,8 +71,16 @@ func execute(cfg config, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "proxysampler: %v\n", err)
 		return exitUsage
 	}
+	if len(proxies)*cfg.count > maxRequests {
+		fmt.Fprintf(stderr, "proxysampler: %d proxies with --count %d is more than %d requests\n", len(proxies), cfg.count, maxRequests)
+		return exitUsage
+	}
 
-	results := sample(cfg, proxies, newProgress(cfg, stderr, len(proxies)))
+	var onResult func(*result)
+	if cfg.output == "jsonl" {
+		onResult = streamResult(stdout)
+	}
+	results := sample(cfg, proxies, newProgress(cfg, stderr, len(proxies)*cfg.count), onResult)
 	rep := newReport(results)
 	if err := writeReport(stdout, cfg.output, rep); err != nil {
 		fmt.Fprintf(stderr, "proxysampler: %v\n", err)
@@ -79,6 +99,10 @@ const usage = `Usage:
 Test one proxy with --proxy, or a list of proxies with --file (one proxy URL
 per line; blank lines and lines starting with # are skipped). Supported proxy
 schemes are http, https, socks5, and socks5h.
+
+Without --proxy or --file, ProxySampler tests proxy.packetstream.io with the
+username and auth key in the PACKETSTREAM_USER and PACKETSTREAM_AUTH_KEY
+environment variables, and the --protocol, --country, and --session options.
 
 Options:
 `
@@ -106,17 +130,24 @@ Exit status is 0 when the success rate is at least --min-success, 1 when it
 is lower, and 2 for usage errors.
 `)
 	}
-	fs.StringVar(&cfg.output, "output", "plaintext", "report format: plaintext, json, or yaml")
+	fs.StringVar(&cfg.output, "output", "plaintext", "report format: plaintext, json, jsonl, or yaml")
 	fs.BoolVar(&cfg.includeResponseBody, "include-response-body", false,
-		"include response bodies (up to 1 MiB each) in JSON and YAML reports")
+		"include response bodies (up to 1 MiB each) in JSON, JSONL, and YAML reports")
 	fs.StringVar(&cfg.proxyFile, "file", "", "`path` to a file with one proxy URL per line")
 	fs.StringVar(&cfg.singleProxy, "proxy", "", "proxy `URL` to test, such as https://user:pass@proxy.packetstream.io:31111")
-	fs.StringVar(&cfg.endpoint, "endpoint", "https://example.com", "`URL` to request through each proxy")
+	fs.StringVar(&cfg.endpoint, "endpoint", "", "`URL` to request through each proxy (default https://example.com, or "+exitCheckURL+" with --check-exit)")
 	fs.IntVar(&cfg.maxThreads, "max-threads", 10, "number of requests to run at once")
 	fs.IntVar(&delayMS, "delay", 50, "minimum time in `milliseconds` between the start of two requests")
 	fs.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "time limit for each request, including the proxy connection")
 	fs.Var(&cfg.expectStatus, "expect-status", "HTTP status `codes` that count as success, comma-separated (default 200-299)")
 	fs.Float64Var(&cfg.minSuccess, "min-success", 100, "minimum success rate, in `percent`, for exit status 0")
+	fs.IntVar(&cfg.count, "count", 1, "number of requests to make through each proxy")
+	fs.BoolVar(&cfg.checkExit, "check-exit", false,
+		"look up each exit IP and country with "+exitCheckURL+"; requests that exit outside their _country- target fail")
+	fs.StringVar(&cfg.protocol, "protocol", "https", "PacketStream proxy `protocol`: https, http, or socks5")
+	fs.StringVar(&cfg.country, "country", "", "PacketStream exit `country`, as a two-letter code such as US")
+	fs.StringVar(&cfg.session, "session", "", "PacketStream sticky session `name`, which keeps the same exit IP")
+	fs.StringVar(&cfg.host, "host", "proxy.packetstream.io", "PacketStream proxy `host`")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -130,12 +161,14 @@ is lower, and 2 for usage errors.
 	}
 
 	switch {
-	case cfg.output != "plaintext" && cfg.output != "json" && cfg.output != "yaml":
-		return cfg, fmt.Errorf("invalid --output %q: use plaintext, json, or yaml", cfg.output)
-	case cfg.proxyFile == "" && cfg.singleProxy == "":
-		return cfg, errors.New("use --proxy or --file to choose the proxies to test")
+	case !slices.Contains([]string{"plaintext", "json", "jsonl", "yaml"}, cfg.output):
+		return cfg, fmt.Errorf("invalid --output %q: use plaintext, json, jsonl, or yaml", cfg.output)
 	case cfg.proxyFile != "" && cfg.singleProxy != "":
 		return cfg, errors.New("use either --proxy or --file, not both")
+	case cfg.count < 1 || cfg.count > maxRequests:
+		return cfg, fmt.Errorf("--count must be between 1 and %d", maxRequests)
+	case cfg.checkExit && cfg.endpoint != "" && cfg.endpoint != exitCheckURL:
+		return cfg, errors.New("--check-exit uses its own endpoint, so it cannot be combined with --endpoint")
 	case cfg.maxThreads < 1:
 		return cfg, errors.New("--max-threads must be at least 1")
 	case delayMS < 0:
@@ -144,6 +177,15 @@ is lower, and 2 for usage errors.
 		return cfg, errors.New("--timeout must be positive")
 	case cfg.minSuccess < 0 || cfg.minSuccess > 100:
 		return cfg, errors.New("--min-success must be between 0 and 100")
+	}
+	if err := checkPacketStreamFlags(cfg, fs); err != nil {
+		return cfg, err
+	}
+	switch {
+	case cfg.checkExit:
+		cfg.endpoint = exitCheckURL
+	case cfg.endpoint == "":
+		cfg.endpoint = "https://example.com"
 	}
 	if err := checkEndpoint(cfg.endpoint); err != nil {
 		return cfg, err
