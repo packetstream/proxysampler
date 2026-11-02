@@ -10,8 +10,16 @@ import (
 	"strings"
 )
 
-// loadProxies returns the proxies chosen with --proxy or --file.
+// loadProxies returns the proxies chosen with --proxy or --file, or the
+// PacketStream proxy.
 func loadProxies(cfg config) ([]*url.URL, error) {
+	if cfg.singleProxy == "" && cfg.proxyFile == "" {
+		p, err := packetStreamProxy(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return []*url.URL{p}, nil
+	}
 	if cfg.singleProxy != "" {
 		p, err := parseProxy(cfg.singleProxy)
 		if err != nil {
