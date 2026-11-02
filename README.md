@@ -191,6 +191,11 @@ Version 1 fixed several reporting bugs, so its reports differ:
 - The exit status reports failures, and invalid options print an error
   instead of a panic.
 
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md),
+and report security issues as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 ProxySampler is licensed under the [GNU General Public License v3.0](LICENSE).
