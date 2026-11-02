@@ -1,0 +1,43 @@
+version: "2"
+
+linters:
+  enable:
+    - bidichk
+    - dupword
+    - errorlint
+    - exhaustive
+    - gocritic
+    - godot
+    - gosec
+    - misspell
+    - nakedret
+    - nilnil
+    - nolintlint
+    - predeclared
+    - usestdlibvars
+    - whitespace
+
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*os.File).Close
+        # Progress and usage text on stderr is best effort.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    rules:
+      # Tests use fake credentials and close test listeners on cleanup.
+      - path: _test\.go
+        linters: [gosec]
+        text: "G101|G104"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports

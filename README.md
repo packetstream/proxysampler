@@ -1,126 +1,138 @@
-# ProxySampler. CLI tool for testing & measuring the health of proxy tunnels.
+# ProxySampler
 
-ProxySampler is a tool for testing proxies and measuring their performance & health.
+ProxySampler tests proxies and reports their success rate and response times.
+Test one proxy or a list of them, and use the exit status in scripts and
+monitoring: it is non-zero when too many requests fail.
 
-## How can I use this?
-Use this tool to check the performance and health of proxy tunnels. Test massive lists or one-off proxies. 
-
-PacketStream customers can use this tool as part of their automation tooling to get metrics on which residential proxy sessions/geolocations are performing more reliably and prioritize those sessions. 
-
-We use this tool internally at PacketStream as part of our infrastructure monitoring toolset to keep an eye on the the health of our proxy tunnel and trigger alerts if something doesn't seem right.
+It works with any HTTP, HTTPS, or SOCKS5 proxy, and was written for
+[PacketStream](https://packetstream.io/) residential proxies.
 
 ## Installation
-#### Go
+
+Install [Go](https://go.dev/dl/) 1.26 or newer, then run:
 
 ```bash
-go get -u github.com/packetstream/proxysampler
+go install github.com/packetstream/proxysampler@latest
 ```
 
-## Usage and options
-You provide the proxy server, port, and auth information. ProxySampler tests the proxy tunnel(s) and returns information about the response codes and response times.
+The binary is installed to `$(go env GOPATH)/bin`.
 
-ProxySampler is straightforward to use and has a few cli arguments for configuration.
+## Usage
 
-```
-Usage: 
-  proxysampler [OPTIONS]
+Test one proxy:
 
-Application Options:
-  --output {json|yaml|plaintext}    Default is plaintext.
-  --include-response-body           Include response bodies in JSON/YAML output. Disabled by default.
-  --file {/path/to/file.txt}        Relative/absolute path to a file containing a list of proxies.
-  --proxy {proxy info}              Test a single proxy tunnel. Example: https://proxyuser:proxypass@packetstream.io:31111
-  --endpoint {https://example.com}  The endpoint that you want to use for testing.
-  --max-threads {10}                Number of concurrent threads to use for testing proxy. Default is 10.
-  --delay {50}                      Delay in ms between each request. Default is 50.
-
-Help Options
-  --help, -h                        Show this screen.
-```
-
-### Usage examples
-
-###### Testing a single PacketStream residential proxy with a US exit IP. JSON output.
 ```bash
-proxysampler --output json --proxy https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111 --endpoint https://example.com
+proxysampler --proxy "https://USER:AUTH_KEY_country-US@proxy.packetstream.io:31111"
 ```
+
+```
+Success rate:      1/1 (100.0%)
+Average TTFB:      221ms
+```
+
+Test every proxy in a file, with a JSON report:
+
+```bash
+proxysampler --file proxies.txt --output json --endpoint https://ipinfo.io/json
+```
+
+The file has one proxy URL per line. Blank lines and lines starting with `#`
+are skipped. See [proxies.txt](proxies.txt) for an example.
+
+Each request uses a new connection. A request succeeds when the endpoint
+answers with a 2xx status, or with one of the codes given to
+`--expect-status`. Anything else counts as a failure, including a proxy that
+rejects its credentials (407) or cannot reach the endpoint (502).
+
+### PacketStream proxy URLs
+
+| Protocol | Proxy URL |
+| --- | --- |
+| HTTPS | `https://USER:AUTH_KEY@proxy.packetstream.io:31111` |
+| HTTP | `http://USER:AUTH_KEY@proxy.packetstream.io:31112` |
+| SOCKS5 | `socks5://USER:AUTH_KEY@proxy.packetstream.io:31113` |
+
+Add `_country-CC` to the auth key to choose the exit country, and
+`_session-NAME` to keep the same exit IP across requests, for example
+`AUTH_KEY_country-US_session-abc123`. Find your username and auth key in the
+[dashboard](https://app.packetstream.io/).
+
+### Options
+
+```
+  --delay milliseconds
+      minimum time in milliseconds between the start of two requests (default 50)
+  --endpoint URL
+      URL to request through each proxy (default https://example.com)
+  --expect-status codes
+      HTTP status codes that count as success, comma-separated (default 200-299)
+  --file path
+      path to a file with one proxy URL per line
+  --include-response-body
+      include response bodies (up to 1 MiB each) in JSON and YAML reports
+  --max-threads int
+      number of requests to run at once (default 10)
+  --min-success percent
+      minimum success rate, in percent, for exit status 0 (default 100)
+  --output string
+      report format: plaintext, json, or yaml (default plaintext)
+  --proxy URL
+      proxy URL to test, such as https://user:pass@proxy.packetstream.io:31111
+  --timeout duration
+      time limit for each request, including the proxy connection (default 30s)
+```
+
+Exit status is 0 when the success rate is at least `--min-success`, 1 when it
+is lower, and 2 for usage errors.
+
+### JSON report
 
 ```json
 {
   "success": 1,
-  "fail": 0,
-  "average_ttfb": 221,
+  "fail": 1,
+  "success_rate": 50,
+  "average_ttfb": 206,
   "results": [
     {
-      "proxy": "https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111",
+      "proxy": "https://USER:xxxxx_country-US@proxy.packetstream.io:31111",
       "endpoint": "https://example.com",
+      "ok": true,
       "status_code": 200,
-      "latency": {
-        "ttfb": 221,
-        "connect": 34,
-        "tls_handshake": 23
-      },
-      "error": null
+      "latency": {"connect": 31, "tls_handshake": 76, "ttfb": 206, "total": 206}
+    },
+    {
+      "proxy": "https://USER:xxxxx_country-CA@proxy.packetstream.io:31111",
+      "endpoint": "https://example.com",
+      "ok": false,
+      "error": "Proxy Authentication Required",
+      "latency": {"connect": 30, "tls_handshake": 40, "ttfb": 0, "total": 0}
     }
   ]
 }
 ```
 
-###### Testing a list of PacketStream residential proxies from a file. JSON output. Include response bodies.
-```bash
-proxysampler --output json --file ./proxies.txt --endpoint https://ifconfig.co/json --include-response-body
-```
+Latencies are in milliseconds. `connect` is the TCP connection to the proxy,
+`tls_handshake` adds up the TLS handshakes with an HTTPS proxy and with the
+endpoint, `ttfb` runs from the start of the request to the first response
+byte, and `total` includes reading up to 1 MiB of the response. Reports show
+proxy passwords as `xxxxx`, keeping any `_country-` and `_session-` options.
 
-```json
-{
-  "success": 3,
-  "fail": 0,
-  "average_ttfb": 693,
-  "results": [
-    {
-      "proxy": "https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111",
-      "endpoint": "https://ifconfig.co/json",
-      "status_code": 200,
-			"response_body": "{\"ip\":\"47.149.139.253\",\"ip_decimal\":798329853,\"country\":\"United States\",\"country_eu\":false,\"country_iso\":\"US\",\"city\":\"Torrance\",\"latitude\":33.846,\"longitude\":-118.3456,\"asn\":\"AS5650\",\"asn_org\":\"Frontier Communications of America, Inc.\"}",
-      "latency": {
-        "ttfb": 552,
-        "connect": 29,
-        "tls_handshake": 141
-      },
-      "error": null
-    },
-    {
-      "proxy": "https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111",
-      "endpoint": "https://ifconfig.co/json",
-      "status_code": 200,
-      "response_body": "{\"ip\":\"63.237.69.254\",\"ip_decimal\":1072514558,\"country\":\"United States\",\"country_eu\":false,\"country_iso\":\"US\",\"city\":\"Walkersville\",\"hostname\":\"ssl.clarkconstruction.com\",\"latitude\":39.4787,\"longitude\":-77.3484,\"asn\":\"AS16431\",\"asn_org\":\"The Clark Construction Group, Inc.\"}",
-      "latency": {
-        "ttfb": 534,
-        "connect": 28,
-        "tls_handshake": 114
-      },
-      "error": null
-    },
-    {
-      "proxy": "https://proxyuser:proxypass_country-US@proxy.packetstream.io:31111",
-      "endpoint": "https://ifconfig.co/json",
-      "status_code": 200,
-      "response_body": "{\"ip\":\"24.167.234.46\",\"ip_decimal\":413657646,\"country\":\"United States\",\"country_eu\":false,\"country_iso\":\"US\",\"city\":\"Milwaukee\",\"hostname\":\"cpe-24-167-234-46.wi.res.rr.com\",\"latitude\":43.1166,\"longitude\":-87.9904,\"asn\":\"AS10796\",\"asn_org\":\"Charter Communications Inc\"}",
-      "latency": {
-        "ttfb": 993,
-        "connect": 27,
-        "tls_handshake": 272
-      },
-      "error": null
-    }
-  ]
-}
-```
+### Upgrading from earlier versions
 
-## Contributing
-We'd love to accept your improvements! Feel free to fork & submit a pull-request if you'd like to make changes.
+Version 1 fixed several reporting bugs, so its reports differ:
 
-## About PacketStream
-PacketStream is a residential proxy network that enables businesses to access the web through a pool of residential IPs. With PacketStream, you can gather data, scrape websites, and perform other web-related tasks with requests originating from real residential ISPs all over the world.
+- A request succeeds only on an expected status. Earlier versions counted
+  any HTTP answer, including 407 and 502, as a success.
+- Errors are strings instead of `{}`, and each result has an `ok` field.
+- `response_body` is spelled correctly and only appears with
+  `--include-response-body`.
+- Proxy passwords are redacted.
+- Blank lines and comments in proxy files are skipped.
+- `--delay` spaces out all requests instead of each thread's requests.
+- The exit status reports failures, and invalid options print an error
+  instead of a panic.
 
-For more information, visit [PacketStream.io](https://packetstream.io/).
+## License
+
+ProxySampler is licensed under the [GNU General Public License v3.0](LICENSE).
