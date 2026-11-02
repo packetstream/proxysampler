@@ -1,0 +1,11 @@
+version: 2
+
+# Wait 20 days before proposing a new release, so a compromised or broken
+# release has time to be found first.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    cooldown: {default-days: 20}
+    groups:
+      gomod: {patterns: ["*"]}
